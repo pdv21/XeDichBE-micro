@@ -1,0 +1,219 @@
+# ============================================================================
+# XeDich — Microservices stack (thay thế docker-compose.yml monolith cũ).
+# Kiến trúc: api-gateway (cổng vào duy nhất, giữ nguyên port 5000 để Frontend
+# KHÔNG cần đổi gì) → 5 service (user/hotel/transport/recommendation/ai).
+# 1 MySQL container, 3 database logic (DB-per-service). 1 Redis container,
+# 2 DB index khác nhau (OTP cache của user-service vs BullMQ của
+# recommendation-service). Xem services/README-split.md để biết lý do thiết kế.
+# ============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: xedich_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "3636:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./services/user-service/database/init.sql:/docker-entrypoint-initdb.d/01_user_init.sql
+      - ./services/hotel-service/database/init.sql:/docker-entrypoint-initdb.d/02_hotel_init.sql
+      - ./services/recommendation-service/database/init.sql:/docker-entrypoint-initdb.d/03_recommendation_init.sql
+      - ./services/recommendation-service/database/locations.seeder.sql:/docker-entrypoint-initdb.d/04_locations_seeder.sql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone=+07:00
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: xedich_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: xedich_phpmyadmin
+    restart: always
+    environment:
+      PMA_HOST: mysql
+      PMA_USER: root
+      PMA_PASSWORD: rootpassword
+    ports:
+      - "8080:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # ── User Service ──────────────────────────────────────────────────────────
+  user-service:
+    build:
+      context: ./services
+      dockerfile: user-service/Dockerfile
+    container_name: xedich_user_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 4001
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: xedich_user_db
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Hotel Service ─────────────────────────────────────────────────────────
+  hotel-service:
+    build:
+      context: ./services
+      dockerfile: hotel-service/Dockerfile
+    container_name: xedich_hotel_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 4002
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: xedich_hotel_db
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      RECOMMENDATION_SERVICE_URL: http://recommendation-service:4004
+    depends_on:
+      mysql:
+        condition: service_healthy
+      recommendation-service:
+        condition: service_started
+
+  # ── Transport Service ─────────────────────────────────────────────────────
+  transport-service:
+    build:
+      context: ./services
+      dockerfile: transport-service/Dockerfile
+    container_name: xedich_transport_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 4003
+
+  # ── AI Service ─────────────────────────────────────────────────────────────
+  ai-service:
+    build:
+      context: ./services
+      dockerfile: ai-service/Dockerfile
+    container_name: xedich_ai_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 4005
+
+  # ── Recommendation Service — API process ──────────────────────────────────
+  recommendation-service:
+    build:
+      context: ./services
+      dockerfile: recommendation-service/Dockerfile
+    container_name: xedich_recommendation_service
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PORT: 4004
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: xedich_recommendation_db
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 1
+      USER_SERVICE_URL: http://user-service:4001
+      HOTEL_SERVICE_URL: http://hotel-service:4002
+      TRANSPORT_SERVICE_URL: http://transport-service:4003
+      AI_SERVICE_URL: http://ai-service:4005
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Recommendation Service — Worker process (BullMQ 'trip-plan' + cron place sync) ──
+  # Cùng image với recommendation-service (build context/dockerfile giống hệt),
+  # chỉ override command để chạy src/worker.js thay vì src/server.js — đúng
+  # nguyên tắc #5 trong kế hoạch tách (API process / Worker process tách biệt).
+  recommendation-worker:
+    build:
+      context: ./services
+      dockerfile: recommendation-service/Dockerfile
+    container_name: xedich_recommendation_worker
+    command: ["node", "src/worker.js"]
+    restart: always
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: xedich_recommendation_db
+      DB_USER: root
+      DB_PASSWORD: rootpassword
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 1
+      USER_SERVICE_URL: http://user-service:4001
+      HOTEL_SERVICE_URL: http://hotel-service:4002
+      TRANSPORT_SERVICE_URL: http://transport-service:4003
+      AI_SERVICE_URL: http://ai-service:4005
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── API Gateway — cổng vào duy nhất, Frontend giữ nguyên NEXT_PUBLIC_API_URL=:5000 ──
+  api-gateway:
+    build:
+      context: ./services
+      dockerfile: api-gateway/Dockerfile
+    container_name: xedich_api_gateway
+    restart: always
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      PORT: 5000
+      USER_SERVICE_URL: http://user-service:4001
+      HOTEL_SERVICE_URL: http://hotel-service:4002
+      TRANSPORT_SERVICE_URL: http://transport-service:4003
+      RECOMMENDATION_SERVICE_URL: http://recommendation-service:4004
+    depends_on:
+      - user-service
+      - hotel-service
+      - transport-service
+      - recommendation-service
+
+volumes:
+  mysql_data:
+  redis_data:

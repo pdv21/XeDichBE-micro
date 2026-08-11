@@ -1,0 +1,15 @@
+{
+  "name": "xedich-microservices",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Monorepo microservices XeDich — npm workspaces, mỗi thư mục con là 1 service triển khai độc lập",
+  "workspaces": [
+    "shared",
+    "user-service",
+    "hotel-service",
+    "transport-service",
+    "recommendation-service",
+    "ai-service",
+    "api-gateway"
+  ]
+}
