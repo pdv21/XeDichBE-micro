@@ -1,0 +1,33 @@
+{
+  "name": "@xedich/user-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "User Service — đăng ký/đăng nhập (OTP+JWT), hồ sơ người dùng, sở thích du lịch",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@xedich/shared": "file:../shared",
+    "bcrypt": "^6.0.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.11.1",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "mysql2": "^3.22.5",
+    "resend": "^6.14.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.4",
+    "supertest": "^7.0.0"
+  },
+  "engines": { "node": ">=18.0.0" }
+}

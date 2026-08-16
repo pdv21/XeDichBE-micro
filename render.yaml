@@ -1,0 +1,254 @@
+# Render Blueprint — deploy toàn bộ stack Backend (trừ MySQL, xem ghi chú bên dưới).
+# Dùng: Render Dashboard → New → Blueprint → chọn repo này (nhánh chứa file này) → Apply.
+#
+# LƯU Ý QUAN TRỌNG TRƯỚC KHI DEPLOY:
+# 1. MySQL: Render KHÔNG có MySQL managed (chỉ có Postgres) — phải dùng DB ngoài.
+#    Khuyến nghị: TiDB Cloud Serverless (miễn phí, tương thích giao thức MySQL,
+#    dùng được với mysql2 driver hiện tại). Tạo cluster xong, điền DB_HOST/DB_PORT/
+#    DB_USER/DB_PASSWORD vào Environment Group "xedich-shared" trong Render Dashboard
+#    (KHÔNG commit giá trị thật vào file này — các key đánh dấu `sync: false` phải
+#    tự điền tay trên dashboard).
+#    3 database (xedich_user_db, xedich_hotel_db, xedich_recommendation_db) cần được
+#    tạo thủ công trên cluster đó trước (chạy nội dung 3 file
+#    services/*/database/init.sql tương ứng qua client MySQL trỏ vào TiDB) vì
+#    Render/TiDB không tự mount docker-entrypoint-initdb.d như MySQL container local.
+# 2. Thiết kế gốc dùng `pserv`/`worker` cho 5 service nội bộ + worker (chỉ
+#    api-gateway lộ public qua cổng 5000). Gói Render "Hobby" hiện tại KHÔNG hỗ
+#    trợ 2 type này nên toàn bộ đã đổi sang `type: web` — các service nội bộ vì
+#    vậy CŨNG có URL public (giảm nhẹ bằng middleware X-Internal-Key ở route
+#    /internal/*). Nếu sau này upgrade plan hỗ trợ pserv/worker, nên đổi lại để
+#    đúng thiết kế bảo mật ban đầu. Dù type nào, service vẫn gọi nhau nội bộ qua
+#    http://<name>:<port> (Render private networking áp dụng cho mọi type).
+# 3. Free plan Render "sleep" sau 15 phút không có traffic (cold start ~30-60s) —
+#    cân nhắc plan trả phí (starter) nếu cần luôn sẵn sàng, đặc biệt api-gateway.
+# 4. Đổi `region` nếu muốn (mặc định singapore — gần Việt Nam nhất hiện Render hỗ trợ).
+# 5. Schema Blueprint của Render có thể thay đổi theo thời gian — nếu `render sync`
+#    báo lỗi field không hợp lệ, đối chiếu lại https://render.com/docs/blueprint-spec.
+
+envVarGroups:
+  - name: xedich-shared
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_HOST
+        sync: false # host cluster MySQL/TiDB ngoài
+      - key: DB_PORT
+        value: "4000" # TiDB Cloud mặc định 4000 — đổi thành 3306 nếu dùng provider khác
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: INTERNAL_API_KEY
+        sync: false
+      - key: FRONTEND_URL
+        sync: false # domain Vercel của Frontend, vd https://xedich.vercel.app
+
+services:
+  # ── API Gateway — service public duy nhất ──────────────────────────────────
+  - type: web
+    name: xedich-api-gateway
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/api-gateway/Dockerfile
+    dockerContext: services
+    envVars:
+      - fromGroup: xedich-shared
+      - key: PORT
+        value: "5000"
+      - key: USER_SERVICE_URL
+        value: http://xedich-user-service:4001
+      - key: HOTEL_SERVICE_URL
+        value: http://xedich-hotel-service:4002
+      - key: TRANSPORT_SERVICE_URL
+        value: http://xedich-transport-service:4003
+      - key: RECOMMENDATION_SERVICE_URL
+        value: http://xedich-recommendation-service:4004
+
+  # ── User Service ─────────────────────────────────────────────────────────
+  - type: web
+    name: xedich-user-service
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/user-service/Dockerfile
+    dockerContext: services
+    envVars:
+      - fromGroup: xedich-shared
+      - key: PORT
+        value: "4001"
+      - key: DB_NAME
+        value: xedich_user_db
+      - key: REDIS_HOST
+        fromService: { name: xedich-redis, type: redis, property: host }
+      - key: REDIS_PORT
+        fromService: { name: xedich-redis, type: redis, property: port }
+      - key: REDIS_DB
+        value: "0"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        value: no-reply@xedich.space
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+
+  # ── Hotel Service ─────────────────────────────────────────────────────────
+  - type: web
+    name: xedich-hotel-service
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/hotel-service/Dockerfile
+    dockerContext: services
+    envVars:
+      - fromGroup: xedich-shared
+      - key: PORT
+        value: "4002"
+      - key: DB_NAME
+        value: xedich_hotel_db
+      - key: RECOMMENDATION_SERVICE_URL
+        value: http://xedich-recommendation-service:4004
+      - key: LITEAPI_BASE_URL
+        value: https://api.liteapi.travel/v3.0
+      - key: LITEAPI_API_KEY
+        sync: false
+      - key: HOTEL_SYNC_MAX_PER_CITY
+        value: "1000"
+
+  # ── Transport Service — không DB ────────────────────────────────────────
+  - type: web
+    name: xedich-transport-service
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/transport-service/Dockerfile
+    dockerContext: services
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "4003"
+      - key: IGNAV_API_KEY
+        sync: false
+
+  # ── AI Service — chỉ service này giữ GEMINI_KEY ────────────────────────────
+  - type: web
+    name: xedich-ai-service
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/ai-service/Dockerfile
+    dockerContext: services
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "4005"
+      - key: GEMINI_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: gemini-flash-latest
+
+  # ── Recommendation Service — API process ──────────────────────────────────
+  - type: web
+    name: xedich-recommendation-service
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/recommendation-service/Dockerfile
+    dockerContext: services
+    envVars:
+      - fromGroup: xedich-shared
+      - key: PORT
+        value: "4004"
+      - key: DB_NAME
+        value: xedich_recommendation_db
+      - key: REDIS_HOST
+        fromService: { name: xedich-redis, type: redis, property: host }
+      - key: REDIS_PORT
+        fromService: { name: xedich-redis, type: redis, property: port }
+      - key: REDIS_DB
+        value: "1"
+      - key: USER_SERVICE_URL
+        value: http://xedich-user-service:4001
+      - key: HOTEL_SERVICE_URL
+        value: http://xedich-hotel-service:4002
+      - key: TRANSPORT_SERVICE_URL
+        value: http://xedich-transport-service:4003
+      - key: AI_SERVICE_URL
+        value: http://xedich-ai-service:4005
+      - key: OPENTRIPMAP_BASE_URL
+        value: https://api.opentripmap.com/0.1/en
+      - key: OPENTRIPMAP_API_KEY
+        sync: false
+      - key: BUDGET_MEAL_COST_VND
+        value: "100000"
+      - key: BUDGET_ATTRACTION_FEE_VND
+        value: "50000"
+      - key: BUDGET_TRANSPORT_VND_PER_DAY
+        value: "250000"
+      - key: BUDGET_TRANSPORT_BIKE_BASE_VND
+        value: "13000"
+      - key: BUDGET_TRANSPORT_BIKE_PER_KM_VND
+        value: "4300"
+      - key: BUDGET_TRANSPORT_CAR_BASE_VND
+        value: "20000"
+      - key: BUDGET_TRANSPORT_CAR_PER_KM_VND
+        value: "12000"
+      - key: BUDGET_TRANSPORT_ROAD_FACTOR
+        value: "1.3"
+      - key: USD_VND_RATE
+        value: "26500"
+
+  # ── Recommendation Service — Worker process (BullMQ + cron place sync) ─────
+  # Cùng Dockerfile với recommendation-service, chỉ đổi dockerCommand để chạy
+  # src/worker.js thay vì src/server.js (giống docker-compose.yml local).
+  # NOTE: đổi từ `type: worker` sang `type: web` vì gói Render "Hobby" hiện tại
+  # không hỗ trợ Background Worker / Private Service (`pserv`) — chỉ Web Service.
+  # worker.js được thêm 1 HTTP server tối giản để bind cổng PORT, thoả điều kiện
+  # health check của Render (không có route thật nào khác được expose).
+  - type: web
+    name: xedich-recommendation-worker
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: services/recommendation-service/Dockerfile
+    dockerContext: services
+    dockerCommand: node src/worker.js
+    envVars:
+      - fromGroup: xedich-shared
+      - key: PORT
+        value: "4099"
+      - key: DB_NAME
+        value: xedich_recommendation_db
+      - key: REDIS_HOST
+        fromService: { name: xedich-redis, type: redis, property: host }
+      - key: REDIS_PORT
+        fromService: { name: xedich-redis, type: redis, property: port }
+      - key: REDIS_DB
+        value: "1"
+      - key: USER_SERVICE_URL
+        value: http://xedich-user-service:4001
+      - key: HOTEL_SERVICE_URL
+        value: http://xedich-hotel-service:4002
+      - key: TRANSPORT_SERVICE_URL
+        value: http://xedich-transport-service:4003
+      - key: AI_SERVICE_URL
+        value: http://xedich-ai-service:4005
+      - key: OPENTRIPMAP_BASE_URL
+        value: https://api.opentripmap.com/0.1/en
+      - key: OPENTRIPMAP_API_KEY
+        sync: false
+
+  # ── Redis — dùng cho OTP cache (user-service, DB 0) + BullMQ (recommendation, DB 1)
+  - type: redis
+    name: xedich-redis
+    plan: free
+    region: singapore
+    ipAllowList: [] # chỉ cho phép service nội bộ trong project, không public
